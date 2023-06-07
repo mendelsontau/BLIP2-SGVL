@@ -14,8 +14,13 @@ import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import drop_path, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
+import functools
+from operator import mul
+
+from torch.nn.modules.utils import _pair
 
 from lavis.common.dist_utils import download_cached_file
+from loralib import layers as lora_layers
 
 def _cfg(url='', **kwargs):
     return {
@@ -42,13 +47,19 @@ class DropPath(nn.Module):
 
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0., lora = -1):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        if lora != -1:
+            self.fc1 = lora_layers.Linear(in_features,hidden_features,r = lora)
+        else:
+            self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
+        if lora != -1:
+            self.fc2 = lora_layers.Linear(hidden_features,out_features,r = lora)
+        else:
+            self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
@@ -64,16 +75,19 @@ class Mlp(nn.Module):
 class Attention(nn.Module):
     def __init__(
             self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.,
-            proj_drop=0., window_size=None, attn_head_dim=None):
+            proj_drop=0., window_size=None, attn_head_dim=None, lora = -1):
         super().__init__()
+        self.lora = lora
         self.num_heads = num_heads
         head_dim = dim // num_heads
         if attn_head_dim is not None:
             head_dim = attn_head_dim
         all_head_dim = head_dim * self.num_heads
         self.scale = qk_scale or head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
+        if lora != -1:
+            self.qkv = lora_layers.Linear(dim, all_head_dim * 3, bias=False, r = lora)
+        else:
+            self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
         if qkv_bias:
             self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
             self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
@@ -112,7 +126,10 @@ class Attention(nn.Module):
             self.relative_position_index = None
 
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(all_head_dim, dim)
+        if lora != -1:
+            self.proj = lora_layers.Linear(all_head_dim, dim, r = lora)
+        else:
+            self.proj = nn.Linear(all_head_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, rel_pos_bias=None):
@@ -122,6 +139,8 @@ class Attention(nn.Module):
             qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
         # qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
+        if self.lora != -1:
+            qkv += F.linear(F.linear(x, self.qkv.lora_A), self.qkv.lora_B)*self.qkv.scaling 
         qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
@@ -152,17 +171,17 @@ class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 window_size=None, attn_head_dim=None):
+                 window_size=None, attn_head_dim=None, lora = -1):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop, window_size=window_size, attn_head_dim=attn_head_dim)
+            attn_drop=attn_drop, proj_drop=drop, window_size=window_size, attn_head_dim=attn_head_dim, lora = lora)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, lora = lora)
 
         if init_values is not None and init_values > 0:
             self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
@@ -183,7 +202,7 @@ class Block(nn.Module):
 class PatchEmbed(nn.Module):
     """ Image to Patch Embedding
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, lora = -1):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
@@ -193,7 +212,10 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.num_patches = num_patches
 
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        if lora == -1:
+            self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        else: 
+            self.proj = lora_layers.Conv2d(in_channels=in_chans, out_channels=embed_dim, kernel_size=patch_size, stride=patch_size, r=lora)
 
     def forward(self, x, **kwargs):
         B, C, H, W = x.shape
@@ -250,14 +272,14 @@ class VisionTransformer(nn.Module):
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
-                 use_mean_pooling=True, init_scale=0.001, use_checkpoint=False):
+                 use_mean_pooling=True, init_scale=0.001, use_checkpoint=False, lora = -1, object_tokens = 0, relation_tokens = 0):
         super().__init__()
         self.image_size = img_size
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
 
         self.patch_embed = PatchEmbed(
-            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+            img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, lora = lora)
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -272,6 +294,27 @@ class VisionTransformer(nn.Module):
         else:
             self.rel_pos_bias = None
         self.use_checkpoint = use_checkpoint
+
+
+        self.objects = object_tokens
+        self.relations = relation_tokens
+        if self.objects > 0:
+            val = math.sqrt(6. / float(3 * functools.reduce(mul, _pair(patch_size), 1) + embed_dim))  #prompt init per visual prompt tuning
+
+            self.object_tokens = nn.Parameter(torch.zeros(1, self.objects, embed_dim))
+            # xavier_uniform initialization
+            nn.init.uniform_(self.object_tokens, -val, val)
+
+        if self.relations > 0:
+            val = math.sqrt(6. / float(3 * functools.reduce(mul, _pair(patch_size), 1) + embed_dim))  #prompt init per visual prompt tuning
+
+            self.relation_tokens = nn.Parameter(torch.zeros(1, self.relations, embed_dim))
+            # xavier_uniform initialization
+            nn.init.uniform_(self.relation_tokens, -val, val)
+
+
+
+
         
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.use_rel_pos_bias = use_rel_pos_bias
@@ -279,7 +322,7 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None)
+                init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None, lora = lora)
             for i in range(depth)])
 #         self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
 #         self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
@@ -322,6 +365,7 @@ class VisionTransformer(nn.Module):
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x):
+        B = x.shape[0]
         x = self.patch_embed(x)
         batch_size, seq_len, _ = x.size()
 
@@ -330,6 +374,17 @@ class VisionTransformer(nn.Module):
         if self.pos_embed is not None:
             x = x + self.pos_embed
         x = self.pos_drop(x)
+
+        if self.objects > 0:
+            if self.relations > 0:
+                object_tokens = self.object_tokens.expand(B, -1, -1)
+                relation_tokens = self.relation_tokens.expand(B, -1, -1)
+
+                x = torch.cat((x[:,0,:].unsqueeze(dim = 1), object_tokens, relation_tokens, x[:,1:,:]), dim=1)
+            else:
+                object_tokens = self.object_tokens.expand(B, -1, -1)
+
+                x = torch.cat((x[:,0,:].unsqueeze(dim = 1), object_tokens, x[:,1:,:]), dim=1)
 
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
         for blk in self.blocks:
@@ -412,7 +467,7 @@ def convert_weights_to_fp16(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
     
     
-def create_eva_vit_g(img_size=224,drop_path_rate=0.4,use_checkpoint=False,precision="fp16"):
+def create_eva_vit_g(img_size=224,drop_path_rate=0.4,use_checkpoint=False,precision="fp16", args = None):
     model = VisionTransformer(
         img_size=img_size,
         patch_size=14,
@@ -425,6 +480,9 @@ def create_eva_vit_g(img_size=224,drop_path_rate=0.4,use_checkpoint=False,precis
         drop_path_rate=drop_path_rate,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         use_checkpoint=use_checkpoint,
+        lora = args.lora if args.image_lora else -1,
+        object_tokens = args.object_tokens if not args.through_query else 0,
+        relation_tokens = args.relation_tokens if not args.through_query else 0
     )  
     url = "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/eva_vit_g.pth"
     cached_file = download_cached_file(

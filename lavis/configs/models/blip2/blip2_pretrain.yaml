@@ -15,7 +15,7 @@ model:
   drop_path_rate: 0
   use_grad_checkpoint: False
   vit_precision: "fp16"
-  freeze_vit: True
+  freeze_vit: False
 
   # Q-Former
   num_query_token: 32

@@ -56,7 +56,7 @@ class BaseModel(nn.Module):
         return msg
 
     @classmethod
-    def from_pretrained(cls, model_type):
+    def from_pretrained(cls, model_type, args):
         """
         Build a pretrained model from default configuration file, specified by model_type.
 
@@ -67,7 +67,7 @@ class BaseModel(nn.Module):
             - model (nn.Module): pretrained or finetuned model, depending on the configuration.
         """
         model_cfg = OmegaConf.load(cls.default_config_path(model_type)).model
-        model = cls.from_config(model_cfg)
+        model = cls.from_config(model_cfg, args)
 
         return model
 

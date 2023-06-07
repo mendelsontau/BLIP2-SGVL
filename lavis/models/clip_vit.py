@@ -12,6 +12,12 @@ from fairscale.nn.checkpoint.checkpoint_activations import checkpoint_wrapper
 from lavis.models.eva_vit import convert_weights_to_fp16
 from lavis.common.dist_utils import download_cached_file
 
+from loralib import layers as lora_layers
+
+import functools
+from operator import mul
+from torch.nn.modules.utils import _pair
+
 class Bottleneck(nn.Module):
     expansion = 4
 
@@ -112,16 +118,26 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, use_grad_checkpointing=False):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, use_grad_checkpointing=False, lora = -1):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        if lora != -1:
+            self.attn = lora_layers.MultiheadAttention(d_model, n_head, r=lora)
+        else:
+            self.attn = nn.MultiheadAttention(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, d_model * 4)),
-            ("gelu", QuickGELU()),
-            ("c_proj", nn.Linear(d_model * 4, d_model))
-        ]))
+        if lora != -1:
+            self.mlp = nn.Sequential(OrderedDict([
+                ("c_fc", lora_layers.Linear(d_model, d_model * 4, r = lora)),
+                ("gelu", QuickGELU()),
+                ("c_proj", lora_layers.Linear(d_model * 4, d_model, r = lora))
+            ]))
+        else:
+            self.mlp = nn.Sequential(OrderedDict([
+                ("c_fc", nn.Linear(d_model, d_model * 4)),
+                ("gelu", QuickGELU()),
+                ("c_proj", nn.Linear(d_model * 4, d_model))
+            ]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
@@ -140,31 +156,54 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, use_grad_checkpointing=False):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, use_grad_checkpointing=False, lora: int = -1):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, use_grad_checkpointing and i>12) for i in range(layers)])
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, use_grad_checkpointing and i>12, lora = lora) for i in range(layers)])
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, use_grad_checkpointing: bool):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, use_grad_checkpointing: bool, lora = -1, object_tokens = 0, relation_tokens = 0):
         super().__init__()
         self.input_resolution = input_resolution
         self.num_features = width
         self.num_heads = heads
         self.num_patches = (input_resolution // patch_size) ** 2
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.object_tokens = object_tokens
+        self.relation_tokens = relation_tokens
+        if lora != -1:
+            self.conv1 = lora_layers.Conv2d(in_channels=3, out_channels=width, kernel_size=(patch_size,patch_size), stride=patch_size, bias=False, r=lora)
+        else: 
+            self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn(self.num_patches + 1, width))
         self.ln_pre = LayerNorm(width)
-        
-        self.transformer = Transformer(width, layers, heads, use_grad_checkpointing=use_grad_checkpointing)
+        if lora != -1:
+            self.transformer = Transformer(width, layers, heads, use_grad_checkpointing=use_grad_checkpointing,lora = lora)
+        else:
+            self.transformer = Transformer(width, layers, heads, use_grad_checkpointing=use_grad_checkpointing,lora = -1)
+
+        if self.object_tokens > 0:
+            val = math.sqrt(6. / float(3 * functools.reduce(mul, _pair(patch_size), 1) + width))  #prompt init per visual prompt tuning
+
+            self.object_prompts = nn.Parameter(torch.zeros(1, object_tokens, width))
+            # xavier_uniform initialization
+            nn.init.uniform_(self.object_prompts, -val, val) 
+
+        self.relation_tokens = relation_tokens
+        if self.relation_tokens > 0:
+            val = math.sqrt(6. / float(3 * functools.reduce(mul, _pair(patch_size), 1) + width))  #prompt init per visual prompt tuning
+
+            self.relation_prompts = nn.Parameter(torch.zeros(1, relation_tokens, width))
+            # xavier_uniform initialization
+            nn.init.uniform_(self.relation_prompts, -val, val) 
+
            
 #         self.ln_final = LayerNorm(width)
 
@@ -176,6 +215,11 @@ class VisionTransformer(nn.Module):
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
+
+        if self.object_tokens > 0 and self.relation_tokens > 0:
+            x = torch.cat([x[:, :1, :],self.object_prompts.expand(x.shape[0], -1, -1), self.relation_prompts.expand(x.shape[0], -1, -1),x[:, 1:, :]], dim=1)
+        elif self.object_tokens > 0:
+            x = torch.cat([x[:, :1, :],self.object_prompts.expand(x.shape[0], -1, -1),x[:, 1:, :]], dim=1)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
@@ -230,7 +274,7 @@ def interpolate_pos_embed(model, state_dict, interpolation: str = 'bicubic', seq
     state_dict['positional_embedding'] = new_pos_embed
     
     
-def create_clip_vit_L(img_size=224,use_checkpoint=False,precision="fp16"):
+def create_clip_vit_L(img_size=224,use_checkpoint=False,precision="fp16", args = None):
     model = VisionTransformer(
             input_resolution=img_size,
             patch_size=14,
@@ -238,6 +282,7 @@ def create_clip_vit_L(img_size=224,use_checkpoint=False,precision="fp16"):
             layers=23,
             heads=16,
             use_grad_checkpointing=use_checkpoint,
+            lora = args.lora if args.image_lora else -1
         )         
     url = "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/clip_vit_L.pth"
     cached_file = download_cached_file(

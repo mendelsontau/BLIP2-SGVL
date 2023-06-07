@@ -7,7 +7,9 @@
  * Based on huggingface code base
  * https://github.com/huggingface/transformers/blob/v4.15.0/src/transformers/models/bert
 """
-
+import sys
+sys.path.insert(0, "/home/gamir/DER-Roei/alon/LAVIS")
+from loralib import layers as lora_layers
 import math
 import os
 import warnings
@@ -51,7 +53,7 @@ logger = logging.get_logger(__name__)
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word and position embeddings."""
 
-    def __init__(self, config):
+    def __init__(self, config, lora = -1):
         super().__init__()
         self.word_embeddings = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
@@ -109,7 +111,7 @@ class BertEmbeddings(nn.Module):
 
 
 class BertSelfAttention(nn.Module):
-    def __init__(self, config, is_cross_attention):
+    def __init__(self, config, is_cross_attention, lora = -1):
         super().__init__()
         self.config = config
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
@@ -123,14 +125,22 @@ class BertSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        if is_cross_attention:
-            self.key = nn.Linear(config.encoder_width, self.all_head_size)
-            self.value = nn.Linear(config.encoder_width, self.all_head_size)
+        if lora != -1:
+            self.query = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora)
+            if is_cross_attention:
+                self.key = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
+                self.value = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
+            else:
+                self.key = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora)
+                self.value = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora)       
         else:
-            self.key = nn.Linear(config.hidden_size, self.all_head_size)
-            self.value = nn.Linear(config.hidden_size, self.all_head_size)
+            self.query = nn.Linear(config.hidden_size, self.all_head_size)
+            if is_cross_attention:
+                self.key = nn.Linear(config.encoder_width, self.all_head_size)
+                self.value = nn.Linear(config.encoder_width, self.all_head_size)
+            else:
+                self.key = nn.Linear(config.hidden_size, self.all_head_size)
+                self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = getattr(
@@ -276,9 +286,12 @@ class BertSelfAttention(nn.Module):
 
 
 class BertSelfOutput(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, lora = -1):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if lora != -1:
+            self.dense = lora_layers.Linear(config.hidden_size, config.hidden_size, r=lora)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -290,10 +303,10 @@ class BertSelfOutput(nn.Module):
 
 
 class BertAttention(nn.Module):
-    def __init__(self, config, is_cross_attention=False):
+    def __init__(self, config, is_cross_attention=False, lora = -1):
         super().__init__()
-        self.self = BertSelfAttention(config, is_cross_attention)
-        self.output = BertSelfOutput(config)
+        self.self = BertSelfAttention(config, is_cross_attention, lora = lora)
+        self.output = BertSelfOutput(config, lora = lora)
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
@@ -347,9 +360,12 @@ class BertAttention(nn.Module):
 
 
 class BertIntermediate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, lora = -1):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        if lora != -1:
+            self.dense = lora_layers.Linear(config.hidden_size, config.intermediate_size, r=lora)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -362,9 +378,12 @@ class BertIntermediate(nn.Module):
 
 
 class BertOutput(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, lora = -1):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        if lora != -1:
+            self.dense = lora_layers.Linear(config.intermediate_size, config.hidden_size, r=lora)
+        else:
+            self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
@@ -376,28 +395,28 @@ class BertOutput(nn.Module):
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config, layer_num):
+    def __init__(self, config, layer_num, lora = -1):
         super().__init__()
         self.config = config
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = BertAttention(config)
+        self.attention = BertAttention(config, lora=lora)
         self.layer_num = layer_num
         if (
             self.config.add_cross_attention
             and layer_num % self.config.cross_attention_freq == 0
         ):
             self.crossattention = BertAttention(
-                config, is_cross_attention=self.config.add_cross_attention
+                config, is_cross_attention=self.config.add_cross_attention, lora = lora
             )
             self.has_cross_attention = True
         else:
             self.has_cross_attention = False
-        self.intermediate = BertIntermediate(config)
-        self.output = BertOutput(config)
+        self.intermediate = BertIntermediate(config, lora = lora)
+        self.output = BertOutput(config, lora = lora)
 
-        self.intermediate_query = BertIntermediate(config)
-        self.output_query = BertOutput(config)
+        self.intermediate_query = BertIntermediate(config, lora = lora)
+        self.output_query = BertOutput(config, lora = lora)
 
     def forward(
         self,
@@ -485,11 +504,11 @@ class BertLayer(nn.Module):
 
 
 class BertEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, lora = -1):
         super().__init__()
         self.config = config
         self.layer = nn.ModuleList(
-            [BertLayer(config, i) for i in range(config.num_hidden_layers)]
+            [BertLayer(config, i, lora = lora) for i in range(config.num_hidden_layers)]
         )
 
     def forward(
@@ -590,9 +609,12 @@ class BertEncoder(nn.Module):
 
 
 class BertPooler(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, lora = -1):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if lora != -1:
+            self.dense = lora_layers.Linear(config.hidden_size, config.hidden_size, r=lora)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states):
@@ -662,14 +684,22 @@ class BertPreTrainedModel(PreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     def _init_weights(self, module):
-        """Initialize the weights"""
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        """ Initialize the weights """
+        if isinstance(module, (nn.Linear, nn.Embedding)) and (not isinstance(module, (lora_layers.Linear, lora_layers.Embedding))):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+        elif isinstance(module, (lora_layers.Linear, lora_layers.Embedding)):
+            if isinstance(module.lora_A, nn.ParameterList):
+                for i in range(len(module.lora_A)):
+                    module.lora_A[i].data.normal_(mean=0.0, std=self.config.initializer_range)
+                    module.lora_B[i].data.normal_(mean=0.0, std=self.config.initializer_range)
+            else:
+                module.lora_A.data.normal_(mean=0.0, std=self.config.initializer_range)
+                module.lora_B.data.normal_(mean=0.0, std=self.config.initializer_range)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
 
@@ -684,15 +714,15 @@ class BertModel(BertPreTrainedModel):
     input to the forward pass.
     """
 
-    def __init__(self, config, add_pooling_layer=False):
+    def __init__(self, config, add_pooling_layer=False, lora = -1):
         super().__init__(config)
         self.config = config
 
-        self.embeddings = BertEmbeddings(config)
+        self.embeddings = BertEmbeddings(config, lora = lora)
 
-        self.encoder = BertEncoder(config)
+        self.encoder = BertEncoder(config, lora = lora)
 
-        self.pooler = BertPooler(config) if add_pooling_layer else None
+        self.pooler = BertPooler(config, lora = lora) if add_pooling_layer else None
 
         self.init_weights()
 
@@ -970,10 +1000,10 @@ class BertLMHeadModel(BertPreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
 
-    def __init__(self, config):
+    def __init__(self, config, sgvl_args = None):
         super().__init__(config)
 
-        self.bert = BertModel(config, add_pooling_layer=False)
+        self.bert = BertModel(config, add_pooling_layer=False, lora = sgvl_args.lora if sgvl_args.text_lora else -1)
         self.cls = BertOnlyMLMHead(config)
 
         self.init_weights()

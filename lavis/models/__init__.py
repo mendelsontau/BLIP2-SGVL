@@ -89,7 +89,7 @@ __all__ = [
 ]
 
 
-def load_model(name, model_type, is_eval=False, device="cpu", checkpoint=None):
+def load_model(name, model_type, args, is_eval=False, device="cpu", checkpoint=None):
     """
     Load supported models.
 
@@ -109,7 +109,7 @@ def load_model(name, model_type, is_eval=False, device="cpu", checkpoint=None):
         model (torch.nn.Module): model.
     """
 
-    model = registry.get_model_class(name).from_pretrained(model_type=model_type)
+    model = registry.get_model_class(name).from_pretrained(model_type=model_type, args=args)
 
     if checkpoint is not None:
         model.load_checkpoint(checkpoint)

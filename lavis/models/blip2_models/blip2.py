@@ -44,7 +44,7 @@ class Blip2Base(BaseModel):
             return contextlib.nullcontext()
 
     @classmethod
-    def init_Qformer(cls, num_query_token, vision_width, cross_attention_freq=2):
+    def init_Qformer(cls, num_query_token, vision_width, cross_attention_freq=2, args = None):
         encoder_config = BertConfig.from_pretrained("bert-base-uncased")
         encoder_config.encoder_width = vision_width
         # insert cross-attention layer every other block
@@ -52,7 +52,7 @@ class Blip2Base(BaseModel):
         encoder_config.cross_attention_freq = cross_attention_freq
         encoder_config.query_length = num_query_token
         Qformer = BertLMHeadModel.from_pretrained(
-            "bert-base-uncased", config=encoder_config
+            "bert-base-uncased", config=encoder_config, sgvl_args = args
         )
         query_tokens = nn.Parameter(
             torch.zeros(1, num_query_token, encoder_config.hidden_size)
@@ -61,7 +61,7 @@ class Blip2Base(BaseModel):
         return Qformer, query_tokens
 
     def init_vision_encoder(
-        self, model_name, img_size, drop_path_rate, use_grad_checkpoint, precision
+        self, model_name, img_size, drop_path_rate, use_grad_checkpoint, precision, args
     ):
         assert model_name in [
             "eva_clip_g",
@@ -70,14 +70,14 @@ class Blip2Base(BaseModel):
         ], "vit model must be eva_clip_g, eva2_clip_L or clip_L"
         if model_name == "eva_clip_g":
             visual_encoder = create_eva_vit_g(
-                img_size, drop_path_rate, use_grad_checkpoint, precision
+                img_size, drop_path_rate, use_grad_checkpoint, precision, args
             )
 #         elif model_name == "eva2_clip_L":
 #             visual_encoder = create_eva2_vit_L(
 #                 img_size, drop_path_rate, use_grad_checkpoint, precision
 #             )
         elif model_name == "clip_L":
-            visual_encoder = create_clip_vit_L(img_size, use_grad_checkpoint, precision)
+            visual_encoder = create_clip_vit_L(img_size, use_grad_checkpoint, precision, args)
         ln_vision = LayerNorm(visual_encoder.num_features)
         self.vit_name = model_name
         return visual_encoder, ln_vision

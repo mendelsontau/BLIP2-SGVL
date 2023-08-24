@@ -129,7 +129,7 @@ class Blip2QformerSGVL(Blip2Base):
         self.Qformer.resize_token_embeddings(len(self.tokenizer))
         state_dict = self.Qformer.state_dict()
         for name, param in self.Qformer.named_parameters():
-            if "_query" in name:
+            if "_query" in name and not "prompts" in name:
                 key_orig = name.replace("_query", "")
                 param.data.copy_(state_dict[key_orig])
 
@@ -154,10 +154,15 @@ class Blip2QformerSGVL(Blip2Base):
         self.through_query = args.through_query
 
         if self.vg_loss_lambda > 0.0:
-            weight_dict = {'loss_ce': args.loss_ce, 'loss_bbox': 5}
-            weight_dict['loss_giou'] = 2
-            losses = ['labels','boxes','cardinality']
-            matcher = HungarianMatcher(cost_class=weight_dict["loss_ce"],cost_bbox=weight_dict["loss_bbox"],cost_giou=weight_dict["loss_giou"]) 
+            if args.loss_ce > 0:
+                weight_dict = {'loss_ce': args.loss_ce, 'loss_bbox': 5}
+                weight_dict['loss_giou'] = 2
+                losses = ['labels','boxes','cardinality']
+            else:
+                weight_dict = {'loss_bbox': 5}
+                weight_dict['loss_giou'] = 2
+                losses = ['boxes']
+            matcher = HungarianMatcher(cost_class=args.loss_ce,cost_bbox=weight_dict["loss_bbox"],cost_giou=weight_dict["loss_giou"]) 
 
 
             self.num_matcher_classes = args.vg_batch_size * args.objects
@@ -197,17 +202,17 @@ class Blip2QformerSGVL(Blip2Base):
 
 
 
-                self.class_head = MLP_Head(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size, self.Qformer.config.hidden_size,args.head_layers).to(device)
+                self.class_head = MLP_Head(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size, embed_dim ,args.head_layers).to(device)
                 self.bb_head = MLP_Head(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size, 4, args.head_layers).to(device)
-                self.random_row = nn.Parameter(torch.zeros(1,self.Qformer.config.hidden_size))
-                self.no_object_row = nn.Parameter(torch.zeros(1,self.Qformer.config.hidden_size))
+                self.random_row = nn.Parameter(torch.zeros(1,embed_dim))
+                self.no_object_row = nn.Parameter(torch.zeros(1,embed_dim))
                 if self.relations > 0:
                     self.num_relation_classes = args.vg_batch_size * args.relations
                     self.vgrelcriterion = SetCriterion(self.num_relation_classes, matcher=matcher, weight_dict=weight_dict,
                                     eos_coef=(1.8/self.relation_tokens), losses=losses)
                     self.vgrelcriterion.to(args.device)
-                    self.no_relation_row = nn.Parameter(torch.zeros(1,self.Qformer.config.hidden_size))
-                    self.rel_class_head = MLP_Head(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size, self.Qformer.config.hidden_size,args.head_layers).to(device)
+                    self.no_relation_row = nn.Parameter(torch.zeros(1,embed_dim))
+                    self.rel_class_head = MLP_Head(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size, embed_dim,args.head_layers).to(device)
                     self.rel_bb_head = MLP_Head(self.Qformer.config.hidden_size, self.Qformer.config.hidden_size, 4, args.head_layers).to(device)
                 
 
@@ -260,6 +265,7 @@ class Blip2QformerSGVL(Blip2Base):
         )
 
         if self.vg_loss_lambda > 0 and self.through_query:
+            sg_tokens = query_output.last_hidden_state[:,self.num_query_token:,:]
             object_tokens = query_output.last_hidden_state[-vg_batch_size:,self.num_query_token:self.num_query_token + self.object_tokens,:]
             if self.relations:
                relation_tokens = query_output.last_hidden_state[-vg_batch_size:,self.num_query_token + self.object_tokens:,:] 
@@ -280,6 +286,11 @@ class Blip2QformerSGVL(Blip2Base):
         if self.negatives_loss:
                         text_negs = self.tokenizer(text[image.shape[0]:image.shape[0] + vg_batch_size],padding='max_length', truncation=True, max_length=self.max_txt_len, 
                             return_tensors="pt").to(image.device)
+
+        if laion_negs != None:
+                        laion_text_negs = self.tokenizer(laion_negs,padding='max_length', truncation=True, max_length=self.max_txt_len, 
+                            return_tensors="pt").to(image.device)
+                        text += laion_negs
         
 
         text_tokens = self.tokenizer(
@@ -305,10 +316,8 @@ class Blip2QformerSGVL(Blip2Base):
                     attention_mask=text_descriptions.attention_mask,
                     return_dict=True,
                 )
-                if self.through_query:
-                    text_feat_descriptions = F.normalize(text_output_descriptions.last_hidden_state[:, 0, :],dim = -1)
-                else:
-                    text_feat_descriptions = F.normalize(self.text_proj(text_output_descriptions.last_hidden_state[:, 0, :]),dim = -1)
+
+                text_feat_descriptions = F.normalize(self.text_proj(text_output_descriptions.last_hidden_state[:, 0, :]),dim = -1)
                 if self.relations > 0:
                     relations_descs_feat_m = text_feat_descriptions[-num_relation_descs:]
                 objects_descs_feat_m = text_feat_descriptions[:num_object_descs]
@@ -325,6 +334,23 @@ class Blip2QformerSGVL(Blip2Base):
             neg_loss = self.hn_loss(image_feat, text_feat, ignore_mask, vg_batch_size)
             #remove neagtives
             text_feat = text_feat[:-vg_batch_size]
+
+        if laion_negs != None:
+            if not torch.sum(laion_neg_mask) == 0.0:
+                laion_image_features = image_feat
+                positive_text_features = text_feat[:image.shape[0],:]
+                negative_text_features = text_feat[-image.shape[0]:,:]
+                positive_similarity,_ = torch.bmm(laion_image_features, positive_text_features.unsqueeze(-1)).squeeze().max(-1)
+                negative_similarity,_ = torch.bmm(laion_image_features, negative_text_features.unsqueeze(-1)).squeeze().max(-1)
+                positive_similarity = torch.exp(positive_similarity)
+                negative_similarity = torch.exp(negative_similarity)
+                denominator = positive_similarity + negative_similarity
+                loss_per_sample = -torch.log(torch.div(positive_similarity,denominator))
+                loss = torch.dot(loss_per_sample, laion_neg_mask)/torch.sum(laion_neg_mask)
+                neg_loss += loss
+            text_feat = text_feat[:image.shape[0]]
+
+
 
         ###============== Image-text Contrastive ===================###
         image_feats_all = concat_all_gather(
@@ -395,6 +421,8 @@ class Blip2QformerSGVL(Blip2Base):
         text_input_ids_world = concat_all_gather(text_no_adds.input_ids)
         text_attention_mask_world = concat_all_gather(text_no_adds.attention_mask)
         image_embeds_world = all_gather_with_grad(image_embeds)
+        if self.through_query:
+            sg_tokens_world = all_gather_with_grad(sg_tokens.contiguous())
         with torch.no_grad():
             weights_t2i = F.softmax(sim_t2i, dim=1) + 1e-4
             weights_t2i[:, rank * bs : rank * bs + bs].fill_diagonal_(0)
@@ -403,10 +431,16 @@ class Blip2QformerSGVL(Blip2Base):
 
         # select a negative image for each text
         image_embeds_neg = []
+        if self.through_query:
+            sg_tokens_neg = []
         for b in range(bs):
             neg_idx = torch.multinomial(weights_t2i[b], 1).item()
             image_embeds_neg.append(image_embeds_world[neg_idx])
+            if self.through_query:
+                sg_tokens_neg.append(sg_tokens_world[neg_idx])
         image_embeds_neg = torch.stack(image_embeds_neg, dim=0)
+        if self.through_query:
+            sg_tokens_neg = torch.stack(sg_tokens_neg, dim=0)
 
         # select a negative text for each image
         text_ids_neg = []
@@ -426,13 +460,13 @@ class Blip2QformerSGVL(Blip2Base):
             [text_no_adds.attention_mask, text_no_adds.attention_mask, text_atts_neg],
             dim=0,
         )
-
+        if self.through_query:
+            sg_tokens_all = torch.cat(
+                [sg_tokens, sg_tokens_neg, sg_tokens], dim=0
+            ) 
         query_tokens_itm = self.query_tokens.expand(text_ids_all.shape[0], -1, -1)
         if self.through_query:
-            sg_tokens = self.object_queries.expand(text_ids_all.shape[0], -1, -1)
-            if self.relations:
-                sg_tokens = torch.cat([sg_tokens,self.relation_queries.expand(text_ids_all.shape[0], -1, -1)],dim=1)
-            query_tokens_itm = torch.cat([query_tokens_itm, sg_tokens],dim=1)
+            query_tokens_itm = torch.cat([query_tokens_itm, sg_tokens_all],dim=1)
         query_atts_itm = torch.ones(query_tokens_itm.size()[:-1], dtype=torch.long).to(
             image.device
         )
@@ -465,33 +499,56 @@ class Blip2QformerSGVL(Blip2Base):
         loss_itm = F.cross_entropy(logits, itm_labels)
 
         if self.negatives_loss:
-            text_neg_input_ids = text_negs.input_ids
+            text_neg_input_ids = torch.cat([text_no_adds.input_ids[-vg_batch_size:,:],text_negs.input_ids],dim = 0)
             query_tokens_itm_neg = self.query_tokens.expand(text_neg_input_ids.shape[0], -1, -1)
             if self.through_query:
-                sg_tokens = self.object_queries.expand(text_neg_input_ids.shape[0], -1, -1)
-                if self.relations:
-                    sg_tokens = torch.cat([sg_tokens,self.relation_queries.expand(text_neg_input_ids.shape[0], -1, -1)],dim=1)
-                query_tokens_itm_neg = torch.cat([query_tokens_itm_neg, sg_tokens],dim=1)
+                sg_tokens_neg = torch.cat([sg_tokens[-vg_batch_size:,:,:],sg_tokens[-vg_batch_size:,:,:]])
+                query_tokens_itm_neg = torch.cat([query_tokens_itm_neg, sg_tokens_neg],dim=1)
             query_atts_itm_neg = torch.ones(query_tokens_itm_neg.size()[:-1], dtype=torch.long).to(
                 image.device
             )
-            text_neg_attention_mask = text_negs.attention_mask
+            text_neg_attention_mask = torch.cat([text_no_adds.attention_mask[-vg_batch_size:,:],text_negs.attention_mask])
             attention_mask_neg = torch.cat([query_atts_itm_neg, text_neg_attention_mask], dim=1)
             output_neg_vg = self.Qformer.bert(text_neg_input_ids,
                                         query_embeds = query_tokens_itm_neg,
                                         attention_mask = attention_mask_neg,
-                                        encoder_hidden_states = image_embeds[-vg_batch_size:],
-                                        encoder_attention_mask = image_atts[-vg_batch_size:],      
+                                        encoder_hidden_states = torch.cat([image_embeds[-vg_batch_size:],image_embeds[-vg_batch_size:]],dim = 0),
+                                        encoder_attention_mask = torch.cat([image_atts[-vg_batch_size:],image_atts[-vg_batch_size:]],dim=0),      
                                         return_dict = True,
                                         )  
 
-            vl_vg_embeddings = torch.cat([vl_embeddings[image.shape[0] - vg_batch_size:image.shape[0],:,:], output_neg_vg.last_hidden_state[:,:self.num_query_token,:]],dim=0)
+            vl_vg_embeddings = output_neg_vg.last_hidden_state[:, : self.num_query_token, :]
             vl_vg_output = self.itm_head(vl_vg_embeddings)
             vl_vg_output = vl_vg_output.mean(dim=1)
             itm_vg_labels = torch.cat([torch.ones(vg_batch_size,dtype=torch.long),torch.zeros(vg_batch_size,dtype=torch.long)],
                             dim=0).to(image.device)
             loss_vg_itm = F.cross_entropy(vl_vg_output, itm_vg_labels)
             neg_loss += loss_vg_itm
+            neg_loss /= 2
+
+        if laion_negs != None:
+            text_negs_input_ids = torch.cat([text_no_adds.input_ids,laion_text_negs.input_ids])
+            query_tokens_laion_neg = self.query_tokens.expand(text_negs_input_ids.shape[0], -1, -1)
+            query_atts_laion_neg = torch.ones(query_tokens_laion_neg.size()[:-1], dtype=torch.long).to(
+                image.device
+            )
+            text_neg_attention_mask = torch.cat([text_no_adds.attention_mask,laion_text_negs.attention_mask])
+            attention_mask_neg = torch.cat([query_atts_laion_neg, text_neg_attention_mask], dim=1)
+            output_neg_laion = self.Qformer.bert(text_negs_input_ids,
+                                        attention_mask = attention_mask_neg,
+                                        query_embeds = query_tokens_laion_neg,
+                                        encoder_hidden_states = torch.cat([image_embeds,image_embeds]),
+                                        encoder_attention_mask = torch.cat([image_atts,image_atts]),      
+                                        return_dict = True,
+                                        )  
+
+            vl_laion_embeddings = output_neg_laion.last_hidden_state[:, : self.num_query_token, :]
+            vl_laion_output = self.itm_head(vl_laion_embeddings)
+            vl_laion_output = vl_laion_output.mean(dim=1)
+            itm_laion_labels = torch.cat([torch.ones(image.shape[0],dtype=torch.long),torch.zeros(image.shape[0],dtype=torch.long)],
+                               dim=0).to(image.device)
+            loss_laion_itm = F.cross_entropy(vl_laion_output, itm_laion_labels)
+            neg_loss += loss_laion_itm
             neg_loss /= 2
 
         return loss_itc, loss_itm, neg_loss, loss_dict, weight_dict
@@ -746,6 +803,47 @@ class Blip2QformerSGVL(Blip2Base):
             args=args
         )
         model.load_checkpoint_from_config(cfg)
+        with torch.no_grad():
+            if args.prompts_lora != -1:
+                if args.through_query:
+                    for l in model.Qformer.bert.encoder.layer:
+                        l.attention.self.query_prompts.weight.copy_(l.attention.self.query.weight)
+                        l.attention.self.query_prompts.bias.copy_(l.attention.self.query.bias)
+                        l.attention.self.key_prompts.weight.copy_(l.attention.self.key.weight)
+                        l.attention.self.key_prompts.bias.copy_(l.attention.self.key.bias)
+                        l.attention.self.value_prompts.weight.copy_(l.attention.self.value.weight)
+                        l.attention.self.value_prompts.bias.copy_(l.attention.self.value.bias)
+                        l.attention.output.dense_prompts.weight.copy_(l.attention.output.dense.weight)
+                        l.attention.output.dense_prompts.bias.copy_(l.attention.output.dense.bias)
+                        if l.has_cross_attention:
+                            l.crossattention.self.query_prompts.weight.copy_(l.crossattention.self.query.weight)
+                            l.crossattention.self.query_prompts.bias.copy_(l.crossattention.self.query.bias)
+                            l.attention.output.dense_prompts.weight.copy_(l.crossattention.output.dense.weight)
+                            l.attention.output.dense_prompts.bias.copy_(l.crossattention.output.dense.bias)
+                        l.intermediate_query.dense_prompts.weight.copy_(l.intermediate_query.dense.weight)
+                        l.intermediate_query.dense_prompts.bias.copy_(l.intermediate_query.dense.bias)
+                        l.output_query.dense_prompts.weight.copy_(l.output_query.dense.weight)
+                        l.output_query.dense_prompts.bias.copy_(l.output_query.dense.bias)
+                else:
+                    for b in model.visual_encoder.blocks:
+                        b.attn.qkv_prompts.weight.copy_(b.attn.qkv.weight)
+                        b.attn.q_bias_prompts.copy_(b.attn.q_bias)
+                        b.attn.v_bias_prompts.copy_(b.attn.v_bias)
+                        b.attn.proj_prompts.weight.copy_(b.attn.proj.weight)
+                        b.mlp_prompts.fc1.weight.copy_(b.mlp.fc1.weight)
+                        b.mlp_prompts.fc1.bias.copy_(b.mlp.fc1.bias)
+                        b.mlp_prompts.fc2.weight.copy_(b.mlp.fc2.weight)
+                        b.mlp_prompts.fc2.bias.copy_(b.mlp.fc2.bias)
+            if args.lora_cross == True:
+                for l in model.Qformer.bert.encoder.layer:
+                    l.crossattention.self.key_prompts.weight.copy_(l.crossattention.self.key.weight)
+                    l.crossattention.self.key_prompts.bias.copy_(l.crossattention.self.key.bias)
+                    l.crossattention.self.value_prompts.weight.copy_(l.crossattention.self.value.weight)
+                    l.crossattention.self.value_prompts.bias.copy_(l.crossattention.self.value.bias)
+                    l.crossattention.self.query_prompts.weight.copy_(l.crossattention.self.query.weight)
+                    l.crossattention.self.query_prompts.bias.copy_(l.crossattention.self.query.bias)
+
+
 
         return model
 

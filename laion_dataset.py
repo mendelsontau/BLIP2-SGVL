@@ -52,6 +52,7 @@ from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
 
 from lavis.processors.randaugment import RandomAugment
+from pertrubations import shuffle_nouns_and_adj, shuffle_allbut_nouns_and_adj, shuffle_within_trigrams, shuffle_trigrams
 
 
 normalize = transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
@@ -458,5 +459,21 @@ def augment_laion_pairs(captions, relations_annotations, attributes_annotations)
         else:
             neg_texts.append("")
             neg_mask.append(0.0)
+    
+    return neg_texts, neg_mask
+
+def augment_laion_pairs2(captions):
+    perturb_functions = [shuffle_nouns_and_adj, shuffle_allbut_nouns_and_adj, shuffle_within_trigrams, shuffle_trigrams]
+    neg_texts = []
+    neg_mask = []
+    for caption in captions:
+        start_index = random.randint(0,3)
+        neg_text = pre_caption(perturb_functions[start_index](caption))
+        if neg_text != caption:
+            neg_texts.append(neg_text)
+            neg_mask.append(1.0)
+        else:
+            neg_texts.append("")
+            neg_mask.append(0.0)           
     
     return neg_texts, neg_mask

@@ -111,9 +111,12 @@ class BertEmbeddings(nn.Module):
 
 
 class BertSelfAttention(nn.Module):
-    def __init__(self, config, is_cross_attention, lora = -1):
+    def __init__(self, config, is_cross_attention, lora = -1, prompts_lora = -1, sg_tokens = 0, lora_cross = -1):
         super().__init__()
         self.config = config
+        self.prompts_lora = prompts_lora
+        self.sg_tokens = sg_tokens
+        self.lora_cross = lora_cross
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
             config, "embedding_size"
         ):
@@ -127,12 +130,24 @@ class BertSelfAttention(nn.Module):
         self.all_head_size = self.num_attention_heads * self.attention_head_size
         if lora != -1:
             self.query = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora)
+            if prompts_lora != -1:
+                self.query_prompts = lora_layers.Linear(config.hidden_size, self.all_head_size, r=prompts_lora)
             if is_cross_attention:
-                self.key = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
-                self.value = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
+                if lora_cross == -1:
+                    self.key = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
+                    self.value = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
+                else:
+                    self.key = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
+                    self.value = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora)
+                    self.key_prompts = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora_cross)
+                    self.value_prompts = lora_layers.Linear(config.encoder_width, self.all_head_size, r=lora_cross)
+                    self.query_prompts = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora_cross) 
             else:
                 self.key = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora)
-                self.value = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora)       
+                self.value = lora_layers.Linear(config.hidden_size, self.all_head_size, r=lora)
+                if prompts_lora != -1:
+                    self.key_prompts = lora_layers.Linear(config.hidden_size, self.all_head_size, r=prompts_lora)
+                    self.value_prompts = lora_layers.Linear(config.hidden_size, self.all_head_size, r=prompts_lora)       
         else:
             self.query = nn.Linear(config.hidden_size, self.all_head_size)
             if is_cross_attention:
@@ -192,27 +207,79 @@ class BertSelfAttention(nn.Module):
         # such that the encoder's padding tokens are not attended to.
         is_cross_attention = encoder_hidden_states is not None
 
-        if is_cross_attention:
+        if is_cross_attention and self.lora_cross == -1:
             key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
             value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
             attention_mask = encoder_attention_mask
+        elif is_cross_attention and self.lora_cross != -1:
+            num_prompt_tokens = encoder_hidden_states.shape[1] - 257
+            patch_cls = torch.cat([encoder_hidden_states[:,0:1,:],encoder_hidden_states[:,num_prompt_tokens + 1 :,:]], dim = 1)
+            sg = encoder_hidden_states[: , 1: 1 + num_prompt_tokens, :]
+            patch_cls_key_layer = self.key(patch_cls)
+            sg_key_layer = self.key_prompts(sg)
+            patch_cls_value_layer = self.value(patch_cls)
+            sg_value_layer = self.value_prompts(sg)
+            key_layer = self.transpose_for_scores(torch.cat([patch_cls_key_layer[:,0:1,:],sg_key_layer,patch_cls_key_layer[:,1:,:]],dim=1))
+            value_layer = self.transpose_for_scores(torch.cat([patch_cls_value_layer[:,0:1,:],sg_value_layer,patch_cls_value_layer[:,1:,:]],dim = 1))
+            attention_mask = encoder_attention_mask
         elif past_key_value is not None:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
+            if self.prompts_lora != -1:
+                regular_tokens = torch.cat([hidden_states[:,:32,:],hidden_states[:,32 + self.sg_tokens:,:]], dim=1)
+                sg_tokens = hidden_states[:,32:32 + self.sg_tokens,:]
+                regular_tokens_key_layer = self.key(regular_tokens)
+                regular_tokens_value_layer = self.value(regular_tokens)
+                sg_tokens_key_layer = self.key_prompts(sg_tokens)
+                sg_tokens_value_layer = self.value_prompts(sg_tokens)
+                key_layer = torch.cat([regular_tokens_key_layer[:,:32,:],sg_tokens_key_layer,regular_tokens_key_layer[:,32:,:]],dim=1)
+                value_layer = torch.cat([regular_tokens_value_layer[:,:32,:],sg_tokens_value_layer,regular_tokens_value_layer[:,32:,:]],dim=1)
+                key_layer = self.transpose_for_scores(key_layer)
+                value_layer = self.transpose_for_scores(value_layer)
+            else:
+                key_layer = self.transpose_for_scores(self.key(hidden_states))
+                value_layer = self.transpose_for_scores(self.value(hidden_states))
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
         else:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
-
-        mixed_query_layer = self.query(hidden_states)
+            if self.prompts_lora != -1:
+                regular_tokens = torch.cat([hidden_states[:,:32,:],hidden_states[:,32 + self.sg_tokens:,:]], dim=1)
+                sg_tokens = hidden_states[:,32:32 + self.sg_tokens,:]
+                regular_tokens_key_layer = self.key(regular_tokens)
+                regular_tokens_value_layer = self.value(regular_tokens)
+                sg_tokens_key_layer = self.key_prompts(sg_tokens)
+                sg_tokens_value_layer = self.value_prompts(sg_tokens)
+                key_layer = torch.cat([regular_tokens_key_layer[:,:32,:],sg_tokens_key_layer,regular_tokens_key_layer[:,32:,:]],dim=1)
+                value_layer = torch.cat([regular_tokens_value_layer[:,:32,:],sg_tokens_value_layer,regular_tokens_value_layer[:,32:,:]],dim=1)
+                key_layer = self.transpose_for_scores(key_layer)
+                value_layer = self.transpose_for_scores(value_layer)
+            else:
+                key_layer = self.transpose_for_scores(self.key(hidden_states))
+                value_layer = self.transpose_for_scores(self.value(hidden_states))
+        if self.prompts_lora != -1:
+            regular_tokens = torch.cat([hidden_states[:,:32,:],hidden_states[:,32 + self.sg_tokens:,:]], dim=1)
+            sg_tokens = hidden_states[:,32:32 + self.sg_tokens,:]
+            regular_tokens_query_layer = self.query(regular_tokens)
+            sg_tokens_query_layer = self.query_prompts(sg_tokens)
+            mixed_query_layer = torch.cat([regular_tokens_query_layer[:,:32,:],sg_tokens_query_layer,regular_tokens_query_layer[:,32:,:]],dim=1)
+        else:
+            mixed_query_layer = self.query(hidden_states)
+        if self.lora_cross != -1:
+            mixed_query_layer_prompts = self.query_prompts(hidden_states)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
+        if is_cross_attention and self.lora_cross != -1:
+            query_layer_prompts = self.transpose_for_scores(mixed_query_layer_prompts)
 
         past_key_value = (key_layer, value_layer)
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        if is_cross_attention and self.lora_cross != -1:
+            patch_cls = torch.cat([key_layer[:,:,0:1,:],key_layer[:,:,num_prompt_tokens + 1:,:]], dim = 2)
+            sg = key_layer[: , :,1: 1 + num_prompt_tokens, :]
+            attention_scores_patch_cls = torch.matmul(query_layer, patch_cls.transpose(-1, -2))
+            attention_scores_prompts = torch.matmul(query_layer_prompts, sg.transpose(-1, -2))
+            attention_scores = torch.cat([attention_scores_patch_cls[:,:,:,0:1],attention_scores_prompts, attention_scores_patch_cls[:,:,:,1:]],dim=3)
+        else:
+            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
 
         if (
             self.position_embedding_type == "relative_key"
@@ -286,27 +353,40 @@ class BertSelfAttention(nn.Module):
 
 
 class BertSelfOutput(nn.Module):
-    def __init__(self, config, lora = -1):
+    def __init__(self, config, lora = -1, prompts_lora = -1, sg_tokens = 0):
         super().__init__()
         if lora != -1:
             self.dense = lora_layers.Linear(config.hidden_size, config.hidden_size, r=lora)
+            if prompts_lora != -1:
+                self.dense_prompts = lora_layers.Linear(config.hidden_size, config.hidden_size, r=prompts_lora)
         else:
             self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.prompts_lora = prompts_lora
+        self.sg_tokens = sg_tokens
 
     def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        if self.prompts_lora != -1:
+            regular_tokens = torch.cat([hidden_states[:,:32,:],hidden_states[:,32 + self.sg_tokens:,:]], dim=1)
+            sg_tokens = hidden_states[:,32:32 + self.sg_tokens,:]
+            regular_tokens = self.dense(regular_tokens)
+            sg_tokens = self.dense_prompts(sg_tokens)
+            hidden_states = torch.cat([regular_tokens[:,:32,:],sg_tokens,regular_tokens[:,32:,:]],dim=1)
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        else:
+            hidden_states = self.dense(hidden_states)
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
 class BertAttention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, lora = -1):
+    def __init__(self, config, is_cross_attention=False, lora = -1, prompts_lora = -1, sg_tokens = 0, lora_cross = -1):
         super().__init__()
-        self.self = BertSelfAttention(config, is_cross_attention, lora = lora)
-        self.output = BertSelfOutput(config, lora = lora)
+        self.self = BertSelfAttention(config, is_cross_attention, lora = lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens, lora_cross = lora_cross)
+        self.output = BertSelfOutput(config, lora = lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens)
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
@@ -360,54 +440,79 @@ class BertAttention(nn.Module):
 
 
 class BertIntermediate(nn.Module):
-    def __init__(self, config, lora = -1):
+    def __init__(self, config, lora = -1, prompts_lora = -1, sg_tokens = 0):
         super().__init__()
         if lora != -1:
             self.dense = lora_layers.Linear(config.hidden_size, config.intermediate_size, r=lora)
+            if prompts_lora != -1:
+               self.dense_prompts = lora_layers.Linear(config.hidden_size, config.intermediate_size, r=prompts_lora) 
         else:
             self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
+        self.prompts_lora = prompts_lora
+        self.sg_tokens = sg_tokens
 
     def forward(self, hidden_states):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
+        if self.prompts_lora != -1:
+            regular_tokens = torch.cat([hidden_states[:,:32,:],hidden_states[:,32 + self.sg_tokens:,:]], dim=1)
+            sg_tokens = hidden_states[:,32:32 + self.sg_tokens,:]
+            regular_tokens = self.dense(regular_tokens)
+            sg_tokens = self.dense_prompts(sg_tokens)
+            hidden_states = torch.cat([regular_tokens[:,:32,:],sg_tokens,regular_tokens[:,32:,:]],dim=1)
+            hidden_states = self.intermediate_act_fn(hidden_states)
+        else:
+            hidden_states = self.dense(hidden_states)
+            hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
 
 class BertOutput(nn.Module):
-    def __init__(self, config, lora = -1):
+    def __init__(self, config, lora = -1, prompts_lora = -1, sg_tokens = 0):
         super().__init__()
         if lora != -1:
             self.dense = lora_layers.Linear(config.intermediate_size, config.hidden_size, r=lora)
+            if prompts_lora != -1:
+               self.dense_prompts = lora_layers.Linear(config.intermediate_size, config.hidden_size, r=prompts_lora) 
         else:
             self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.prompts_lora = prompts_lora
+        self.sg_tokens = sg_tokens
 
     def forward(self, hidden_states, input_tensor):
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        if self.prompts_lora != -1:
+            regular_tokens = torch.cat([hidden_states[:,:32,:],hidden_states[:,32 + self.sg_tokens:,:]], dim=1)
+            sg_tokens = hidden_states[:,32:32 + self.sg_tokens,:]
+            regular_tokens = self.dense(regular_tokens)
+            sg_tokens = self.dense_prompts(sg_tokens)
+            hidden_states = torch.cat([regular_tokens[:,:32,:],sg_tokens,regular_tokens[:,32:,:]],dim=1)
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.LayerNorm(hidden_states + input_tensor)
+        else:
+            hidden_states = self.dense(hidden_states)
+            hidden_states = self.dropout(hidden_states)
+            hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config, layer_num, lora = -1):
+    def __init__(self, config, layer_num, lora = -1, prompts_lora = -1, sg_tokens = 0, lora_cross = -1):
         super().__init__()
         self.config = config
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = BertAttention(config, lora=lora)
+        self.attention = BertAttention(config, lora=lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens, lora_cross = -1)
         self.layer_num = layer_num
         if (
             self.config.add_cross_attention
             and layer_num % self.config.cross_attention_freq == 0
         ):
             self.crossattention = BertAttention(
-                config, is_cross_attention=self.config.add_cross_attention, lora = lora
+                config, is_cross_attention=self.config.add_cross_attention, lora = lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens, lora_cross = lora_cross
             )
             self.has_cross_attention = True
         else:
@@ -415,8 +520,8 @@ class BertLayer(nn.Module):
         self.intermediate = BertIntermediate(config, lora = lora)
         self.output = BertOutput(config, lora = lora)
 
-        self.intermediate_query = BertIntermediate(config, lora = lora)
-        self.output_query = BertOutput(config, lora = lora)
+        self.intermediate_query = BertIntermediate(config, lora = lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens)
+        self.output_query = BertOutput(config, lora = lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens)
 
     def forward(
         self,
@@ -504,11 +609,11 @@ class BertLayer(nn.Module):
 
 
 class BertEncoder(nn.Module):
-    def __init__(self, config, lora = -1):
+    def __init__(self, config, lora = -1, prompts_lora = -1, sg_tokens = 0, lora_cross = -1):
         super().__init__()
         self.config = config
         self.layer = nn.ModuleList(
-            [BertLayer(config, i, lora = lora) for i in range(config.num_hidden_layers)]
+            [BertLayer(config, i, lora = lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens, lora_cross=lora_cross) for i in range(config.num_hidden_layers)]
         )
 
     def forward(
@@ -714,13 +819,13 @@ class BertModel(BertPreTrainedModel):
     input to the forward pass.
     """
 
-    def __init__(self, config, add_pooling_layer=False, lora = -1):
+    def __init__(self, config, add_pooling_layer=False, lora = -1, prompts_lora = -1, sg_tokens = 0, lora_cross = -1):
         super().__init__(config)
         self.config = config
 
         self.embeddings = BertEmbeddings(config, lora = lora)
 
-        self.encoder = BertEncoder(config, lora = lora)
+        self.encoder = BertEncoder(config, lora = lora, prompts_lora = prompts_lora, sg_tokens = sg_tokens, lora_cross = lora_cross)
 
         self.pooler = BertPooler(config, lora = lora) if add_pooling_layer else None
 
@@ -1002,8 +1107,8 @@ class BertLMHeadModel(BertPreTrainedModel):
 
     def __init__(self, config, sgvl_args = None):
         super().__init__(config)
-
-        self.bert = BertModel(config, add_pooling_layer=False, lora = sgvl_args.lora if sgvl_args.text_lora else -1)
+        sg_num_tokens = sgvl_args.object_tokens + sgvl_args.relation_tokens if (sgvl_args.through_query and sgvl_args.prompts_lora != -1) else 0
+        self.bert = BertModel(config, add_pooling_layer=False, lora = sgvl_args.text_lora, prompts_lora = sgvl_args.prompts_lora if sgvl_args.through_query else -1, sg_tokens = sg_num_tokens, lora_cross = sgvl_args.lora_cross)
         self.cls = BertOnlyMLMHead(config)
 
         self.init_weights()

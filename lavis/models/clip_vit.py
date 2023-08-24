@@ -176,7 +176,8 @@ class VisionTransformer(nn.Module):
         self.object_tokens = object_tokens
         self.relation_tokens = relation_tokens
         if lora != -1:
-            self.conv1 = lora_layers.Conv2d(in_channels=3, out_channels=width, kernel_size=(patch_size,patch_size), stride=patch_size, bias=False, r=lora)
+            self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+            #self.conv1 = lora_layers.Conv2d(in_channels=3, out_channels=width, kernel_size=(patch_size,patch_size), stride=patch_size, bias=False, r=lora)
         else: 
             self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
@@ -282,7 +283,9 @@ def create_clip_vit_L(img_size=224,use_checkpoint=False,precision="fp16", args =
             layers=23,
             heads=16,
             use_grad_checkpointing=use_checkpoint,
-            lora = args.lora if args.image_lora else -1
+            lora = args.image_lora,
+            object_tokens=args.object_tokens,
+            relation_tokens = args.relation_tokens
         )         
     url = "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/clip_vit_L.pth"
     cached_file = download_cached_file(

@@ -75,9 +75,11 @@ class Mlp(nn.Module):
 class Attention(nn.Module):
     def __init__(
             self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.,
-            proj_drop=0., window_size=None, attn_head_dim=None, lora = -1):
+            proj_drop=0., window_size=None, attn_head_dim=None, lora = -1, prompts_lora = -1, num_prompts = 0):
         super().__init__()
         self.lora = lora
+        self.prompts_lora = prompts_lora
+        self.num_prompts = num_prompts
         self.num_heads = num_heads
         head_dim = dim // num_heads
         if attn_head_dim is not None:
@@ -88,12 +90,17 @@ class Attention(nn.Module):
             self.qkv = lora_layers.Linear(dim, all_head_dim * 3, bias=False, r = lora)
         else:
             self.qkv = nn.Linear(dim, all_head_dim * 3, bias=False)
+        if prompts_lora != -1:
+            self.qkv_prompts = lora_layers.Linear(dim, all_head_dim * 3, bias=False, r = prompts_lora)
         if qkv_bias:
             self.q_bias = nn.Parameter(torch.zeros(all_head_dim))
             self.v_bias = nn.Parameter(torch.zeros(all_head_dim))
         else:
             self.q_bias = None
             self.v_bias = None
+        if qkv_bias and prompts_lora != -1:
+            self.q_bias_prompts = nn.Parameter(torch.zeros(all_head_dim))
+            self.v_bias_prompts = nn.Parameter(torch.zeros(all_head_dim))
 
         if window_size:
             self.window_size = window_size
@@ -130,6 +137,8 @@ class Attention(nn.Module):
             self.proj = lora_layers.Linear(all_head_dim, dim, r = lora)
         else:
             self.proj = nn.Linear(all_head_dim, dim)
+        if prompts_lora != -1:
+            self.proj_prompts = lora_layers.Linear(all_head_dim, dim, r = prompts_lora)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x, rel_pos_bias=None):
@@ -137,13 +146,25 @@ class Attention(nn.Module):
         qkv_bias = None
         if self.q_bias is not None:
             qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
+            if self.prompts_lora != -1:
+                qkv_bias_prompts = torch.cat((self.q_bias_prompts, torch.zeros_like(self.v_bias_prompts, requires_grad=False), self.v_bias_prompts))
         # qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
-        if self.lora != -1:
-            qkv += F.linear(F.linear(x, self.qkv.lora_A), self.qkv.lora_B)*self.qkv.scaling 
+        if self.prompts_lora == -1:
+            qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
+            if self.lora != -1:
+                qkv += F.linear(F.linear(x, self.qkv.lora_A), self.qkv.lora_B)*self.qkv.scaling 
+
+        else:
+            patch_cls = torch.cat([x[:, 0:1, :], x[:, 1 + self.num_prompts:, :]],dim=1)
+            prompts = x[:, 1:1 + self.num_prompts, :]
+            qkv_patch_cls = F.linear(input=patch_cls, weight=self.qkv.weight, bias=qkv_bias)
+            if self.lora != -1:
+                qkv_patch_cls += F.linear(F.linear(patch_cls, self.qkv.lora_A), self.qkv.lora_B) * self.qkv.scaling
+            qkv_prompts = F.linear(input=prompts, weight=self.qkv_prompts.weight, bias=qkv_bias_prompts)
+            qkv_prompts += F.linear(F.linear(prompts, self.qkv_prompts.lora_A), self.qkv_prompts.lora_B) * self.qkv_prompts.scaling
+            qkv = torch.cat((qkv_patch_cls[:,0:1,:], qkv_prompts,qkv_patch_cls[:,1:,:]), dim=1)
         qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
-
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
@@ -160,9 +181,15 @@ class Attention(nn.Module):
         
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-
         x = (attn @ v).transpose(1, 2).reshape(B, N, -1)
-        x = self.proj(x)
+        if self.prompts_lora != -1:
+            patch_cls = torch.cat([x[:, 0:1, :], x[:, 1 + self.num_prompts:, :]],dim=1)
+            prompts = x[:, 1:1 + self.num_prompts, :]
+            patch_cls = self.proj(patch_cls)
+            prompts = self.proj_prompts(prompts)
+            x = torch.cat([patch_cls[:,0:1,:], prompts, patch_cls[:,1:,:]], dim=1)
+        else:
+            x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
@@ -171,17 +198,25 @@ class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 window_size=None, attn_head_dim=None, lora = -1):
+                 window_size=None, attn_head_dim=None, lora = -1, prompts_lora = -1, num_prompts = 0):
         super().__init__()
         self.norm1 = norm_layer(dim)
+        self.prompts_lora = prompts_lora
+        self.num_prompts = num_prompts
+        if prompts_lora != -1:
+            self.norm1_prompts = norm_layer(dim)
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
-            attn_drop=attn_drop, proj_drop=drop, window_size=window_size, attn_head_dim=attn_head_dim, lora = lora)
+            attn_drop=attn_drop, proj_drop=drop, window_size=window_size, attn_head_dim=attn_head_dim, lora = lora, prompts_lora=prompts_lora, num_prompts=num_prompts)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
+        if prompts_lora != -1:
+            self.norm2_prompts = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, lora = lora)
+        if prompts_lora != -1:
+            self.mlp_prompts = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, lora = prompts_lora)
 
         if init_values is not None and init_values > 0:
             self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
@@ -191,8 +226,26 @@ class Block(nn.Module):
 
     def forward(self, x, rel_pos_bias=None):
         if self.gamma_1 is None:
-            x = x + self.drop_path(self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
+            if self.prompts_lora == -1:
+                x = x + self.drop_path(self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
+                x = x + self.drop_path(self.mlp(self.norm2(x)))
+            else:
+                x_prev = x
+                patch_cls = torch.cat([x[:, 0:1, :], x[:, 1 + self.num_prompts:, :]],dim=1)
+                prompts = x[:, 1:1 + self.num_prompts, :]
+                patch_cls = self.norm1(patch_cls)
+                prompts = self.norm1_prompts(prompts)
+                x = torch.cat((patch_cls[:,0:1,:], prompts, patch_cls[:,1:,:]), dim=1)
+                x = x_prev + self.drop_path(self.attn(x, rel_pos_bias=rel_pos_bias))
+                x_prev = x
+                patch_cls = torch.cat([x[:, 0:1, :], x[:, 1 + self.num_prompts:, :]],dim=1)
+                prompts = x[:, 1:1 + self.num_prompts, :]
+                patch_cls = self.norm2(patch_cls)
+                prompts = self.norm2_prompts(prompts)
+                patch_cls = self.mlp(patch_cls)
+                prompts = self.mlp_prompts(prompts)
+                x = torch.cat((patch_cls[:,0:1,:], prompts, patch_cls[:,1:,:]), dim=1)
+                x = x_prev + self.drop_path(x)
         else:
             x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
             x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
@@ -214,8 +267,9 @@ class PatchEmbed(nn.Module):
 
         if lora == -1:
             self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        else: 
-            self.proj = lora_layers.Conv2d(in_channels=in_chans, out_channels=embed_dim, kernel_size=patch_size, stride=patch_size, r=lora)
+        else:
+            self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+            #self.proj = lora_layers.Conv2d(in_channels=in_chans, out_channels=embed_dim, kernel_size=patch_size, stride=patch_size, r=lora)
 
     def forward(self, x, **kwargs):
         B, C, H, W = x.shape
@@ -272,7 +326,7 @@ class VisionTransformer(nn.Module):
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
                  use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
-                 use_mean_pooling=True, init_scale=0.001, use_checkpoint=False, lora = -1, object_tokens = 0, relation_tokens = 0):
+                 use_mean_pooling=True, init_scale=0.001, use_checkpoint=False, lora = -1, prompts_lora = -1, object_tokens = 0, relation_tokens = 0):
         super().__init__()
         self.image_size = img_size
         self.num_classes = num_classes
@@ -322,7 +376,7 @@ class VisionTransformer(nn.Module):
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None, lora = lora)
+                init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None, lora = lora, prompts_lora = prompts_lora, num_prompts=self.objects + self.relations)
             for i in range(depth)])
 #         self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
 #         self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
@@ -480,7 +534,8 @@ def create_eva_vit_g(img_size=224,drop_path_rate=0.4,use_checkpoint=False,precis
         drop_path_rate=drop_path_rate,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         use_checkpoint=use_checkpoint,
-        lora = args.lora if args.image_lora else -1,
+        lora = args.image_lora,
+        prompts_lora = args.prompts_lora,
         object_tokens = args.object_tokens if not args.through_query else 0,
         relation_tokens = args.relation_tokens if not args.through_query else 0
     )  

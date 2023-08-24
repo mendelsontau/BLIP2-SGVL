@@ -32,7 +32,7 @@ from lavis.models.blip2_models.blip2_qformer_sgvl import Blip2QformerSGVL
 from lavis.common.optims import cosine_lr_schedule
 #from data import create_dataset, create_sampler, create_loader
 #from data.coco_karpathy_dataset import coco_karpathy_caption_eval
-from laion_dataset import get_data, augment_laion_pairs
+from laion_dataset import get_data, augment_laion_pairs2
 from vg_dataset import VgDatasetText, get_vg_loader, get_vg_val_loader
 from Winoground.evaluate_winoground import evaluate_winoground, blip_processor
 from vsr.evaluate_vsr import evaluate_vsr
@@ -478,7 +478,8 @@ def train(model, data_loader, optimizer, scaler, epoch, device, args, vg_data_lo
         laion_negs = None
         laion_neg_mask = None
         if args.laion_augmentations:
-            laion_negs, laion_neg_mask = augment_laion_pairs(caption, relations_annotations, attributes_annotations)
+            #laion_negs, laion_neg_mask = augment_laion_pairs(caption, relations_annotations, attributes_annotations)
+            laion_negs, laion_neg_mask = augment_laion_pairs2(caption)
             laion_neg_mask = torch.tensor(laion_neg_mask).to(device,non_blocking=True)
         neg_mask = None
         objects_descs = None
@@ -648,7 +649,7 @@ def main(args):
     #                        vit_grad_ckpt=config['vit_grad_ckpt'], vit_ckpt_layer=config['vit_ckpt_layer'], 
     #                         queue_size=config['queue_size'], negative_all_rank=config['negative_all_rank'], args = args)
     model = load_model("blip2_sgvl", args.visual_encoder, args, device=device)
-    if args.lora != -1:
+    if args.image_lora != -1 or args.text_lora != -1:
         mark_only_lora_as_trainable(model)
     
     if args.lock:
@@ -958,9 +959,8 @@ if __name__ == '__main__':
     parser.add_argument('--auxiliary-frequency', default = 0, type=int)
     parser.add_argument('--checkpoint-frequency', default = 0, type=int)
     parser.add_argument('--vsr-frequency', default = 0, type=int)
-    parser.add_argument('--lora', default = -1, type=int)
-    parser.add_argument('--text-lora', action='store_true')
-    parser.add_argument('--image-lora', action='store_true')
+    parser.add_argument('--text-lora', default = -1, type=int)
+    parser.add_argument('--image-lora', default = -1, type=int)
     parser.add_argument('--prompts-lora', default = -1, type=int)
     parser.add_argument('--resume', default = None, type=str)
     parser.add_argument('--lr', default = 0.00005, type=float)

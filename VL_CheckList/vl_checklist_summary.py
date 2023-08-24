@@ -31,7 +31,7 @@ subclasses = {"attribute_action" :{"sum":0.0, "samples":0},
 "object_location" :{"sum":0.0, "samples":0},
 "object_size" :{"sum":0.0, "samples":0},
 "relation_action" :{"sum":0.0, "samples":0}}
-directory = "output/baseline_clip_l/vlchecklist/0"
+directory = "output/only_negatives36/vlchecklist/3"
 for filename in os.listdir(directory):
     f = os.path.join(directory, filename)
     # checking if it is a file

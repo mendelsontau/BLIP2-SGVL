@@ -75,6 +75,16 @@ class BLIP2(VLPModel):
                         if self.args.relations:
                             sg_tokens = torch.cat([sg_tokens,model.relation_queries.expand(image_embeds.shape[0], -1, -1)],dim=1)
                         query_tokens = torch.cat([query_tokens, sg_tokens],dim=1)
+                        query_output = model.Qformer.bert(
+                            query_embeds=query_tokens,
+                            encoder_hidden_states=image_embeds,
+                            encoder_attention_mask=image_atts,
+                            use_cache=True,
+                            return_dict=True,
+                        )
+                        sg_tokens = query_output.last_hidden_state[:,model.num_query_token:,:]
+                        query_tokens = model.query_tokens.expand(image_embeds.shape[0], -1, -1)
+                        query_tokens = torch.cat([query_tokens, sg_tokens],dim=1)
 
                     query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(
                         image.device

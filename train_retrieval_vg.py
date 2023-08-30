@@ -26,6 +26,8 @@ from torch.utils.data import DataLoader
 from lavis.models import load_model
 from torch.cuda.amp import autocast as autocast
 from torch.cuda.amp.grad_scaler import GradScaler
+from cc3m_data import get_data_cc3m
+from coco_data import get_data_coco
 
 from lavis.common.dist_utils import get_rank, init_distributed_mode, get_world_size, is_main_process
 from lavis.models.blip2_models.blip2_qformer_sgvl import Blip2QformerSGVL
@@ -740,10 +742,18 @@ def main(args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))        
 
-    #### laion Dataset #### 
-    print("Creating laion dataset")
-    data = get_data(args, epoch=start_epoch)
-    train_loader = data["train"].dataloader
+    if args.cc3m:
+        print("Creating cc3m dataset")
+        data = get_data_cc3m(args, epoch=start_epoch)
+        train_loader = data["train"].dataloader
+    elif args.coco:
+        print("Creating coco dataset")
+        data = get_data_coco(args, epoch=start_epoch)
+        train_loader = data["train"].dataloader
+    else:
+        print("Creating laion dataset")
+        data = get_data(args, epoch=start_epoch)
+        train_loader = data["train"].dataloader
 
     #### vg Dataset ####
     vg_dataloader = None 
@@ -937,6 +947,8 @@ if __name__ == '__main__':
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--distributed', default=True, type=bool)
     parser.add_argument('--train-data', default = '../../../datasets/laion/images/{34230..72957}.tar', type=str)
+    parser.add_argument('--cc3m', action='store_true')
+    parser.add_argument('--coco', action='store_true')
     parser.add_argument('--train-num-samples', default = 0, type=int)
     parser.add_argument('--dataset-type', default = "auto", type=str)
     parser.add_argument('--workers', default = 1, type=int)
